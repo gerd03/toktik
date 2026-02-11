@@ -71,3 +71,14 @@ For true fine-tuning/tuned-model workflows, use Google Cloud Vertex AI tuned mod
 - Do not hardcode API keys in source files.
 - Keep `.env` private.
 - If your key was shared publicly, rotate it immediately in Google AI Studio/Cloud.
+
+## 6) Vercel deployment
+
+This project is configured for static Expo web export on Vercel:
+- `buildCommand`: `npm run build:web`
+- `outputDirectory`: `dist`
+
+If Vercel still shows a downloaded/unknown file:
+1. In Vercel Project Settings, set **Framework Preset** to `Other`.
+2. Ensure **Root Directory** is this app folder (where `package.json` exists).
+3. Redeploy after pulling latest commit.
