@@ -28,6 +28,11 @@ export type AutomationProfile = AutomationBrief & {
   createdAt: string;
 };
 
+export type LiveSellingBrief = {
+  productName: string;
+  productInfo: string;
+};
+
 export type FeedbackExample = {
   id: string;
   createdAt: string;
@@ -51,8 +56,35 @@ export type ScriptPostPackage = {
   hashtags: string[];
 };
 
+export type LiveFaqItem = {
+  question: string;
+  answer: string;
+};
+
+export type LiveSellingOutput = {
+  liveTitle: string;
+  aboutMe: string;
+  openingLines: string[];
+  productPitchLines: string[];
+  lowViewerRepeatLines: string[];
+  highViewerRepeatLines: string[];
+  engagementPrompts: string[];
+  closingLines: string[];
+  faqs: LiveFaqItem[];
+  randomQuestionFramework: string[];
+  complianceNotes: string[];
+};
+
+export type LiveFollowUpOutput = {
+  question: string;
+  answer: string;
+  fallbackIfUnsure: string;
+  complianceNotes: string[];
+};
+
 export type StrategyOutput = {
   strategySummary: string;
+  complianceNotes: string[];
   positioning: {
     audience: string;
     painPoint: string;

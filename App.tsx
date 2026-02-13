@@ -4,6 +4,8 @@ import {
   Manrope_700Bold,
   useFonts,
 } from "@expo-google-fonts/manrope";
+import { Audio } from "expo-av";
+import { BlurView } from "expo-blur";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -28,6 +30,8 @@ import {
 import {
   generateAffiliateStrategy,
   generateAutomationStrategy,
+  generateLiveFollowUpAnswer,
+  generateLiveSellingPlan,
 } from "./src/services/gemini";
 import {
   getAutomationProfiles,
@@ -41,6 +45,9 @@ import {
   AutomationBrief,
   AutomationProfile,
   FeedbackExample,
+  LiveFollowUpOutput,
+  LiveSellingBrief,
+  LiveSellingOutput,
   ProductBrief,
   ProductProfile,
   ScriptPostPackage,
@@ -67,9 +74,15 @@ const EMPTY_AUTOMATION: AutomationBrief = {
   brandTone: "Confident Taglish, clear, practical, and trustworthy",
 };
 
+const EMPTY_LIVE_INPUT: LiveSellingBrief = {
+  productName: "",
+  productInfo: "",
+};
+
 type ProductFieldKey = keyof ProductBrief;
 type AutomationFieldKey = keyof AutomationBrief;
-type WorkflowMode = "guided" | "automation";
+type LiveFieldKey = keyof LiveSellingBrief;
+type WorkflowMode = "guided" | "automation" | "live";
 type OutputView = "summary" | "scripts" | "distribution" | "execution";
 const IS_WEB = Platform.OS === "web";
 const USE_NATIVE_ANIMATION_DRIVER = !IS_WEB;
@@ -101,14 +114,19 @@ export default function App() {
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [product, setProduct] = useState<ProductBrief>(EMPTY_PRODUCT);
   const [autoInput, setAutoInput] = useState<AutomationBrief>(EMPTY_AUTOMATION);
+  const [liveInput, setLiveInput] = useState<LiveSellingBrief>(EMPTY_LIVE_INPUT);
   const [profiles, setProfiles] = useState<ProductProfile[]>([]);
   const [autoProfiles, setAutoProfiles] = useState<AutomationProfile[]>([]);
   const [feedbackExamples, setFeedbackExamples] = useState<FeedbackExample[]>([]);
   const [strategy, setStrategy] = useState<StrategyOutput | null>(null);
+  const [liveOutput, setLiveOutput] = useState<LiveSellingOutput | null>(null);
+  const [liveQuestion, setLiveQuestion] = useState("");
+  const [liveFollowUp, setLiveFollowUp] = useState<LiveFollowUpOutput | null>(null);
   const [strategySourceMode, setStrategySourceMode] = useState<WorkflowMode | null>(null);
   const [strategyProductName, setStrategyProductName] = useState("");
   const [outputView, setOutputView] = useState<OutputView>("summary");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isGeneratingLiveFollowUp, setIsGeneratingLiveFollowUp] = useState(false);
   const [isSavingFeedback, setIsSavingFeedback] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [feedbackRating, setFeedbackRating] = useState<number>(4);
@@ -120,8 +138,16 @@ export default function App() {
   );
   const [statusModalTitle, setStatusModalTitle] = useState("");
   const [statusModalMessage, setStatusModalMessage] = useState("");
+  const [toastVisible, setToastVisible] = useState(false);
+  const [toastTone, setToastTone] = useState<"info" | "success" | "error">("info");
+  const [toastMessage, setToastMessage] = useState("");
   const outputFade = useRef(new Animated.Value(1)).current;
+  const toastAnim = useRef(new Animated.Value(0)).current;
   const statusModalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const processingSoundRef = useRef<Audio.Sound | null>(null);
+  const successSoundRef = useRef<Audio.Sound | null>(null);
+  const errorSoundRef = useRef<Audio.Sound | null>(null);
 
   const envApiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY?.trim() ?? "";
   const effectiveApiKey = (apiKeyInput.trim() || envApiKey).trim();
@@ -166,8 +192,160 @@ export default function App() {
       if (statusModalTimerRef.current) {
         clearTimeout(statusModalTimerRef.current);
       }
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+      }
     };
   }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function initAudio() {
+      try {
+        await Audio.setAudioModeAsync({
+          playsInSilentModeIOS: true,
+          shouldDuckAndroid: true,
+        });
+
+        const [processingResult, successResult, errorResult] = await Promise.all([
+          Audio.Sound.createAsync(require("./assets/sfx-processing.wav"), {
+            shouldPlay: false,
+            volume: 0.35,
+          }),
+          Audio.Sound.createAsync(require("./assets/sfx-success.wav"), {
+            shouldPlay: false,
+            volume: 0.55,
+          }),
+          Audio.Sound.createAsync(require("./assets/sfx-error.wav"), {
+            shouldPlay: false,
+            volume: 0.45,
+          }),
+        ]);
+
+        if (!mounted) {
+          await Promise.all([
+            processingResult.sound.unloadAsync(),
+            successResult.sound.unloadAsync(),
+            errorResult.sound.unloadAsync(),
+          ]);
+          return;
+        }
+
+        processingSoundRef.current = processingResult.sound;
+        successSoundRef.current = successResult.sound;
+        errorSoundRef.current = errorResult.sound;
+      } catch {
+        processingSoundRef.current = null;
+        successSoundRef.current = null;
+        errorSoundRef.current = null;
+      }
+    }
+
+    initAudio().catch(() => {
+      processingSoundRef.current = null;
+      successSoundRef.current = null;
+      errorSoundRef.current = null;
+    });
+
+    return () => {
+      mounted = false;
+      const sounds = [
+        processingSoundRef.current,
+        successSoundRef.current,
+        errorSoundRef.current,
+      ].filter((item): item is Audio.Sound => Boolean(item));
+      sounds.forEach((sound) => {
+        sound.unloadAsync().catch(() => {});
+      });
+    };
+  }, []);
+
+  async function playStatusSound(type: "processing" | "success" | "error") {
+    const sound =
+      type === "processing"
+        ? processingSoundRef.current
+        : type === "success"
+          ? successSoundRef.current
+          : errorSoundRef.current;
+
+    if (!sound) {
+      return;
+    }
+
+    try {
+      await sound.stopAsync();
+      await sound.setPositionAsync(0);
+      await sound.playAsync();
+    } catch {
+      // ignore audio playback errors
+    }
+  }
+
+  function showToast(
+    tone: "info" | "success" | "error",
+    message: string,
+    autoCloseMs = 2600,
+  ) {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+
+    toastAnim.setValue(0);
+    setToastTone(tone);
+    setToastMessage(message);
+    setToastVisible(true);
+
+    Animated.timing(toastAnim, {
+      toValue: 1,
+      duration: 220,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: USE_NATIVE_ANIMATION_DRIVER,
+    }).start();
+
+    if (autoCloseMs > 0) {
+      toastTimerRef.current = setTimeout(() => {
+        hideToast();
+      }, autoCloseMs);
+    }
+  }
+
+  function hideToast() {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+
+    Animated.timing(toastAnim, {
+      toValue: 0,
+      duration: 180,
+      easing: Easing.in(Easing.cubic),
+      useNativeDriver: USE_NATIVE_ANIMATION_DRIVER,
+    }).start(() => {
+      setToastVisible(false);
+    });
+  }
+
+  function isQuotaOrCreditError(message: string): boolean {
+    const lower = message.toLowerCase();
+    return (
+      lower.includes("quota") ||
+      lower.includes("resource exhausted") ||
+      lower.includes("429") ||
+      lower.includes("billing") ||
+      lower.includes("insufficient") ||
+      lower.includes("credit")
+    );
+  }
+
+  function normalizeGenerationError(error: unknown, fallback: string): string {
+    const raw = error instanceof Error ? error.message : fallback;
+    if (isQuotaOrCreditError(raw)) {
+      return "Gemini API credits/quota are exhausted. Please top up or use a new key, then try again.";
+    }
+    return raw;
+  }
 
   function showStatusModal(
     type: "processing" | "success" | "error",
@@ -184,6 +362,15 @@ export default function App() {
     setStatusModalTitle(title);
     setStatusModalMessage(message);
     setStatusModalVisible(true);
+    void playStatusSound(type);
+
+    if (type === "processing") {
+      showToast("info", message, 2200);
+    } else if (type === "success") {
+      showToast("success", message, 2600);
+    } else {
+      showToast("error", message, 3600);
+    }
 
     if (autoCloseMs && autoCloseMs > 0) {
       statusModalTimerRef.current = setTimeout(() => {
@@ -231,6 +418,10 @@ export default function App() {
 
   function updateAutoField(key: AutomationFieldKey, value: string) {
     setAutoInput((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function updateLiveField(key: LiveFieldKey, value: string) {
+    setLiveInput((prev) => ({ ...prev, [key]: value }));
   }
 
   function clearError() {
@@ -307,10 +498,37 @@ export default function App() {
 
   function validateApi(): boolean {
     if (!effectiveApiKey) {
-      setErrorText("Gemini API key is required. Put it in the field or in .env.");
+      const message = "Gemini API key is required. Put it in the field or in .env.";
+      setErrorText(message);
+      showToast("error", message, 3400);
       return false;
     }
     return true;
+  }
+
+  function getEffectiveFeedbackExamples(): FeedbackExample[] {
+    const worked = feedbackWorked.trim();
+    const improve = feedbackImprove.trim();
+    if (!worked && !improve) {
+      return feedbackExamples;
+    }
+
+    const transient: FeedbackExample = {
+      id: `transient_${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      rating: feedbackRating,
+      whatWorked: worked,
+      whatToImprove: improve,
+      productName:
+        strategyProductName ||
+        product.productName ||
+        autoInput.productName ||
+        liveInput.productName ||
+        "Current product",
+      outputSnapshot: "Transient unsaved feedback from current session.",
+    };
+
+    return [transient, ...feedbackExamples];
   }
 
   async function handleGenerateGuided() {
@@ -343,12 +561,16 @@ export default function App() {
 
     try {
       await saveProductProfile(product);
+      const effectiveFeedbackExamples = getEffectiveFeedbackExamples();
       const output = await generateAffiliateStrategy({
         apiKey: effectiveApiKey,
         product,
-        feedbackExamples,
+        feedbackExamples: effectiveFeedbackExamples,
       });
       setStrategy(output);
+      setLiveOutput(null);
+      setLiveFollowUp(null);
+      setLiveQuestion("");
       setStrategySourceMode("guided");
       setStrategyProductName(product.productName.trim());
       setOutputView("summary");
@@ -361,9 +583,13 @@ export default function App() {
         1800,
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to generate strategy.";
+      const message = normalizeGenerationError(error, "Failed to generate strategy.");
       setErrorText(message);
-      showStatusModal("error", "Generation Failed", message);
+      showStatusModal(
+        "error",
+        isQuotaOrCreditError(message) ? "API Credits Exhausted" : "Generation Failed",
+        message,
+      );
     } finally {
       setIsGenerating(false);
     }
@@ -391,12 +617,16 @@ export default function App() {
     setIsGenerating(true);
     try {
       await saveAutomationProfile(autoInput);
+      const effectiveFeedbackExamples = getEffectiveFeedbackExamples();
       const output = await generateAutomationStrategy({
         apiKey: effectiveApiKey,
         input: autoInput,
-        feedbackExamples,
+        feedbackExamples: effectiveFeedbackExamples,
       });
       setStrategy(output);
+      setLiveOutput(null);
+      setLiveFollowUp(null);
+      setLiveQuestion("");
       setStrategySourceMode("automation");
       setStrategyProductName(autoInput.productName.trim());
       setOutputView("summary");
@@ -409,12 +639,115 @@ export default function App() {
         1800,
       );
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to generate automation output.";
+      const message = normalizeGenerationError(
+        error,
+        "Failed to generate automation output.",
+      );
       setErrorText(message);
-      showStatusModal("error", "Generation Failed", message);
+      showStatusModal(
+        "error",
+        isQuotaOrCreditError(message) ? "API Credits Exhausted" : "Generation Failed",
+        message,
+      );
     } finally {
       setIsGenerating(false);
+    }
+  }
+
+  async function handleGenerateLiveSelling() {
+    clearError();
+    if (!liveInput.productName.trim()) {
+      setErrorText("Product name is required for Live Selling mode.");
+      return;
+    }
+    if (!liveInput.productInfo.trim()) {
+      setErrorText("Product info/description is required for Live Selling mode.");
+      return;
+    }
+    if (!validateApi()) {
+      return;
+    }
+
+    showStatusModal(
+      "processing",
+      "Generating Live Selling Kit",
+      "Please wait while AI creates your live script playbook and FAQ responses.",
+    );
+    setIsGenerating(true);
+    try {
+      const effectiveFeedbackExamples = getEffectiveFeedbackExamples();
+      const output = await generateLiveSellingPlan({
+        apiKey: effectiveApiKey,
+        input: liveInput,
+        feedbackExamples: effectiveFeedbackExamples,
+      });
+      setLiveOutput(output);
+      setLiveFollowUp(null);
+      setLiveQuestion("");
+      setStrategy(null);
+      setStrategySourceMode("live");
+      setStrategyProductName(liveInput.productName.trim());
+      animateOutputTransition();
+      showStatusModal(
+        "success",
+        "Successfully Generated",
+        "Live selling playbook is ready. Scroll to Live Selling Output.",
+        1800,
+      );
+    } catch (error) {
+      const message = normalizeGenerationError(
+        error,
+        "Failed to generate live selling output.",
+      );
+      setErrorText(message);
+      showStatusModal(
+        "error",
+        isQuotaOrCreditError(message) ? "API Credits Exhausted" : "Generation Failed",
+        message,
+      );
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  async function handleGenerateLiveFollowUp() {
+    clearError();
+    if (!liveOutput) {
+      setErrorText("Generate a Live Selling output first.");
+      return;
+    }
+    if (!liveQuestion.trim()) {
+      setErrorText("Type a live viewer question first.");
+      return;
+    }
+    if (!validateApi()) {
+      return;
+    }
+
+    setIsGeneratingLiveFollowUp(true);
+    try {
+      const effectiveFeedbackExamples = getEffectiveFeedbackExamples();
+      const output = await generateLiveFollowUpAnswer({
+        apiKey: effectiveApiKey,
+        input: liveInput,
+        question: liveQuestion.trim(),
+        liveOutput,
+        feedbackExamples: effectiveFeedbackExamples,
+      });
+      setLiveFollowUp(output);
+    } catch (error) {
+      const message = normalizeGenerationError(
+        error,
+        "Failed to generate live follow-up answer.",
+      );
+      setErrorText(message);
+      if (isQuotaOrCreditError(message)) {
+        showStatusModal("error", "API Credits Exhausted", message);
+      } else {
+        showToast("error", message, 3600);
+      }
+    } finally {
+      setIsGeneratingLiveFollowUp(false);
     }
   }
 
@@ -436,6 +769,7 @@ export default function App() {
       const snapshot = JSON.stringify({
         mode: strategySourceMode,
         summary: strategy.strategySummary,
+        complianceNote: strategy.complianceNotes[0] ?? "",
         hooks: strategy.hooks.slice(0, 3),
         firstScript: strategy.videoScripts[0]?.script ?? "",
         firstPostTitle: strategy.scriptPostPackages[0]?.postTitle ?? "",
@@ -463,17 +797,29 @@ export default function App() {
   }
 
   async function handleRegenerate() {
-    if (activeMode === "automation") {
+    const regenerateMode = strategySourceMode ?? activeMode;
+    if (regenerateMode === "automation") {
       await handleGenerateAutomation();
+      return;
+    }
+    if (regenerateMode === "live") {
+      await handleGenerateLiveSelling();
       return;
     }
     await handleGenerateGuided();
   }
 
-  const activeModeLabel = activeMode === "automation" ? "AutoPilot" : "Guided";
+  const activeModeLabel =
+    activeMode === "automation"
+      ? "AutoPilot"
+      : activeMode === "live"
+        ? "Live Selling"
+        : "Guided";
   const lastGeneratedLabel =
     strategySourceMode === "automation"
       ? "AutoPilot"
+      : strategySourceMode === "live"
+        ? "Live Selling"
       : strategySourceMode === "guided"
         ? "Guided"
         : "None yet";
@@ -492,31 +838,63 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar style="light" />
-      <KeyboardAvoidingView
-        style={styles.keyboardAvoid}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      <StatusBar style="dark" />
+      <LinearGradient
+        colors={["#e7f0ff", "#ecf7ff", "#f5fffb", "#fff5ec"]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={styles.pageGradient}
       >
-        <ScrollView
-          contentContainerStyle={styles.content}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
+        <LinearGradient
+          colors={["rgba(255,255,255,0.55)", "rgba(255,255,255,0.06)"]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.glowOrbTop}
+        />
+        <LinearGradient
+          colors={["rgba(28,132,255,0.22)", "rgba(64,221,173,0.08)"]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.glowOrbRight}
+        />
+        <LinearGradient
+          colors={["rgba(255,197,129,0.24)", "rgba(255,255,255,0.08)"]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.glowOrbBottom}
+        />
+        <KeyboardAvoidingView
+          style={styles.keyboardAvoid}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
-          <LinearGradient colors={["#0f766e", "#0b4f67"]} style={styles.heroCard}>
-            <Text style={styles.heroTitle}>Affiliate Growth Copilot</Text>
-            <Text style={styles.heroSubtitle}>
-              Modern mobile workflow for TikTok affiliates. Choose how much control you want.
-            </Text>
-            <View style={styles.heroBadgeRow}>
-              <Badge text="2 Workflow Options" />
-              <Badge text="Taglish Script Engine" />
-              <Badge text="Feedback Memory" />
-            </View>
-          </LinearGradient>
+          <ScrollView
+            contentContainerStyle={styles.content}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <BlurView intensity={46} tint="light" style={styles.heroWrap}>
+              <LinearGradient
+                colors={["rgba(15,118,110,0.9)", "rgba(10,73,115,0.86)"]}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.heroCard}
+              >
+                <View style={styles.heroShine} />
+                <Text style={styles.heroTitle}>Affiliate Growth Copilot</Text>
+                <Text style={styles.heroSubtitle}>
+                  Modern mobile workflow for TikTok affiliates. Choose how much control you want.
+                </Text>
+                <View style={styles.heroBadgeRow}>
+                  <Badge text="3 Workflow Options" />
+                  <Badge text="Taglish Script Engine" />
+                  <Badge text="Feedback Memory" />
+                </View>
+              </LinearGradient>
+            </BlurView>
 
           <SectionCard
             title="Choose Workflow"
-            subtitle="Pick how you want to work today: detailed control or fast automation."
+            subtitle="Pick how you want to work today: detailed strategy, fast automation, or live selling scripts."
           >
             <View style={styles.modeSwitch}>
               <ModeButton
@@ -528,6 +906,11 @@ export default function App() {
                 label="AutoPilot"
                 isActive={activeMode === "automation"}
                 onPress={() => switchMode("automation")}
+              />
+              <ModeButton
+                label="Live Selling"
+                isActive={activeMode === "live"}
+                onPress={() => switchMode("live")}
               />
             </View>
           </SectionCard>
@@ -582,6 +965,9 @@ export default function App() {
                 onChangeText={(value) => updateProductField("price", value)}
                 placeholder="PHP 299"
               />
+              <Text style={styles.metaText}>
+                Price is used for value context only. Final outputs avoid exact fixed price claims.
+              </Text>
               <Field
                 label="Target Audience"
                 value={product.targetAudience}
@@ -625,7 +1011,9 @@ export default function App() {
                 />
               </View>
             </SectionCard>
-          ) : (
+          ) : null}
+
+          {activeMode === "automation" ? (
             <SectionCard
               title="Option 2: AutoPilot Automation"
               subtitle="Minimal input mode. AI infers audience, content angles, scripts, and plan."
@@ -656,6 +1044,9 @@ export default function App() {
                 onChangeText={(value) => updateAutoField("price", value)}
                 placeholder="PHP 399"
               />
+              <Text style={styles.metaText}>
+                Price is treated as context. AI will use dynamic wording like "check latest price in basket".
+              </Text>
               <Field
                 label="Brand Tone"
                 value={autoInput.brandTone}
@@ -678,7 +1069,39 @@ export default function App() {
                 />
               </View>
             </SectionCard>
-          )}
+          ) : null}
+
+          {activeMode === "live" ? (
+            <SectionCard
+              title="Option 3: Live Selling Copilot"
+              subtitle="Input product basics. AI gives live script flow, FAQ answers, and safe response lines."
+            >
+              <Field
+                label="Product Name"
+                value={liveInput.productName}
+                onChangeText={(value) => updateLiveField("productName", value)}
+                placeholder="Example: Nvision IP24V1 Monitor"
+              />
+              <Field
+                label="Product Info / Description"
+                value={liveInput.productInfo}
+                onChangeText={(value) => updateLiveField("productInfo", value)}
+                placeholder="Use case, key specs, inclusions, and audience fit"
+                multiline
+              />
+              <Text style={styles.metaText}>
+                Output includes live title (15+ chars), about-me text (30+ chars), repeat lines for low/high viewers, and FAQ responses.
+              </Text>
+              <View style={styles.actionRowSingle}>
+                <ActionButton
+                  label={isGenerating ? "Generating..." : "Generate Live Selling Script"}
+                  kind="primary"
+                  disabled={isGenerating}
+                  onPress={handleGenerateLiveSelling}
+                />
+              </View>
+            </SectionCard>
+          ) : null}
 
           {activeMode === "guided" && profiles.length ? (
             <SectionCard title="Saved Guided Profiles" subtitle="Tap to load this profile.">
@@ -716,7 +1139,90 @@ export default function App() {
             </SectionCard>
           ) : null}
 
-          {strategy ? (
+          {liveOutput && activeMode === "live" ? (
+            <SectionCard
+              title="Live Selling Output"
+              subtitle="Use these lines live. Repeat and adapt based on audience flow."
+            >
+              <MiniTitle text="Live Title (15+ chars)" />
+              <Text style={styles.liveHeadline}>{liveOutput.liveTitle}</Text>
+
+              <MiniTitle text="About Me (30+ chars)" />
+              <Text style={styles.bodyText}>{liveOutput.aboutMe}</Text>
+
+              <MiniTitle text="Opening Lines" />
+              <SimpleList items={liveOutput.openingLines} />
+
+              <MiniTitle text="Product Pitch Lines" />
+              <SimpleList items={liveOutput.productPitchLines} />
+
+              <MiniTitle text="Repeat When Viewers Are Low" />
+              <SimpleList items={liveOutput.lowViewerRepeatLines} />
+
+              <MiniTitle text="Repeat When Viewers Increase" />
+              <SimpleList items={liveOutput.highViewerRepeatLines} />
+
+              <MiniTitle text="Engagement Prompts" />
+              <SimpleList items={liveOutput.engagementPrompts} />
+
+              <MiniTitle text="Closing Lines" />
+              <SimpleList items={liveOutput.closingLines} />
+
+              <MiniTitle text="FAQ with Suggested Answers" />
+              {liveOutput.faqs.map((item, index) => (
+                <View key={`${item.question}_${index}`} style={styles.faqCard}>
+                  <Text style={styles.faqQuestion}>
+                    Q{index + 1}: {item.question}
+                  </Text>
+                  <Text style={styles.faqAnswer}>A: {item.answer}</Text>
+                </View>
+              ))}
+
+              <MiniTitle text="Unknown Question Response Framework" />
+              <SimpleList items={liveOutput.randomQuestionFramework} />
+
+              <MiniTitle text="Compliance Guardrails" />
+              <SimpleList items={liveOutput.complianceNotes} />
+            </SectionCard>
+          ) : null}
+
+          {liveOutput && activeMode === "live" ? (
+            <SectionCard
+              title="Live Follow-up Q&A"
+              subtitle="Type random viewer questions that are not in FAQ and generate compliant answers."
+            >
+              <Field
+                label="Viewer Question"
+                value={liveQuestion}
+                onChangeText={setLiveQuestion}
+                placeholder="Ex: Safe ba ito for everyday use? Bakit iba minsan ang price?"
+                multiline
+              />
+              <View style={styles.actionRowSingle}>
+                <ActionButton
+                  label={isGeneratingLiveFollowUp ? "Generating..." : "Generate Live Answer"}
+                  kind="primary"
+                  disabled={isGeneratingLiveFollowUp || isGenerating}
+                  onPress={handleGenerateLiveFollowUp}
+                />
+              </View>
+
+              {liveFollowUp ? (
+                <View style={styles.postKitCard}>
+                  <Text style={styles.postKitLabel}>Question</Text>
+                  <Text style={styles.postKitValue}>{liveFollowUp.question}</Text>
+                  <Text style={styles.postKitLabel}>Live Answer</Text>
+                  <Text style={styles.postKitValue}>{liveFollowUp.answer}</Text>
+                  <Text style={styles.postKitLabel}>Fallback If Unsure</Text>
+                  <Text style={styles.postKitValue}>{liveFollowUp.fallbackIfUnsure}</Text>
+                  <Text style={styles.postKitLabel}>Compliance Notes</Text>
+                  <SimpleList items={liveFollowUp.complianceNotes} />
+                </View>
+              ) : null}
+            </SectionCard>
+          ) : null}
+
+          {strategy && activeMode !== "live" ? (
             <SectionCard
               title="AI Output"
               subtitle="Review the latest generated strategy output."
@@ -780,6 +1286,13 @@ export default function App() {
                   <>
                     <MiniTitle text="Strategy Summary" />
                     <Text style={styles.bodyText}>{strategy.strategySummary}</Text>
+
+                    {strategy.complianceNotes.length ? (
+                      <>
+                        <MiniTitle text="Compliance Guardrails" />
+                        <SimpleList items={strategy.complianceNotes} />
+                      </>
+                    ) : null}
 
                     <MiniTitle text="Positioning" />
                     <Bullet text={`Audience: ${strategy.positioning.audience}`} />
@@ -872,11 +1385,14 @@ export default function App() {
             </SectionCard>
           ) : null}
 
-          {strategy ? (
+          {strategy && activeMode !== "live" ? (
             <SectionCard
               title="Alignment Feedback"
               subtitle="Rate this output. Next generations will align to your preferences."
             >
+              <Text style={styles.metaText}>
+                Regenerate applies your current feedback text immediately. Save Feedback stores it for future sessions.
+              </Text>
               <Text style={styles.metaText}>Rating</Text>
               <View style={styles.ratingRow}>
                 {[1, 2, 3, 4, 5].map((value) => (
@@ -933,29 +1449,57 @@ export default function App() {
             </SectionCard>
           ) : null}
 
-          <SectionCard
-            title="Memory & Tuning"
-            subtitle="Local memory-based alignment is active. Vertex tuning preview included."
-          >
-            <Text style={styles.bodyText}>Stored feedback examples: {feedbackExamples.length}</Text>
-            {recentFeedback.map((item) => (
-              <Text key={item.id} style={styles.metaText}>
-                [{item.rating}/5] {item.productName} - {item.whatWorked || "No note"}
-              </Text>
-            ))}
-            {tuningPreview.length ? (
-              <>
-                <MiniTitle text="Vertex Tuning Preview (JSONL-style lines)" />
-                {tuningPreview.map((line, index) => (
-                  <Text key={`tune_${index}`} style={styles.tuningLine}>
-                    {line}
-                  </Text>
-                ))}
-              </>
-            ) : null}
-          </SectionCard>
-        </ScrollView>
-      </KeyboardAvoidingView>
+            <SectionCard
+              title="Memory & Tuning"
+              subtitle="Local memory-based alignment is active. Vertex tuning preview included."
+            >
+              <Text style={styles.bodyText}>Stored feedback examples: {feedbackExamples.length}</Text>
+              {recentFeedback.map((item) => (
+                <Text key={item.id} style={styles.metaText}>
+                  [{item.rating}/5] {item.productName} - {item.whatWorked || "No note"}
+                </Text>
+              ))}
+              {tuningPreview.length ? (
+                <>
+                  <MiniTitle text="Vertex Tuning Preview (JSONL-style lines)" />
+                  {tuningPreview.map((line, index) => (
+                    <Text key={`tune_${index}`} style={styles.tuningLine}>
+                      {line}
+                    </Text>
+                  ))}
+                </>
+              ) : null}
+            </SectionCard>
+          </ScrollView>
+        </KeyboardAvoidingView>
+
+        {toastVisible ? (
+          <View pointerEvents="box-none" style={styles.toastLayer}>
+            <Animated.View
+              style={[
+                styles.toastCard,
+                toastTone === "success" ? styles.toastSuccess : null,
+                toastTone === "error" ? styles.toastError : null,
+                {
+                  opacity: toastAnim,
+                  transform: [
+                    {
+                      translateY: toastAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [-16, 0],
+                      }),
+                    },
+                  ],
+                },
+              ]}
+            >
+              <BlurView intensity={38} tint="light" style={styles.toastGlass}>
+                <Text style={styles.toastText}>{toastMessage}</Text>
+              </BlurView>
+            </Animated.View>
+          </View>
+        ) : null}
+      </LinearGradient>
 
       <Modal
         transparent
@@ -968,7 +1512,7 @@ export default function App() {
         }}
       >
         <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
+          <BlurView intensity={44} tint="light" style={styles.modalCard}>
             <View
               style={[
                 styles.modalIconWrap,
@@ -994,7 +1538,7 @@ export default function App() {
                 <Text style={styles.modalButtonText}>Close</Text>
               </Pressable>
             )}
-          </View>
+          </BlurView>
         </View>
       </Modal>
     </SafeAreaView>
@@ -1024,7 +1568,7 @@ function SectionCard({
   return (
     <Animated.View
       style={[
-        styles.card,
+        styles.cardMotionWrap,
         {
           opacity: fadeIn,
           transform: [
@@ -1038,9 +1582,18 @@ function SectionCard({
         },
       ]}
     >
-      <Text style={styles.cardTitle}>{title}</Text>
-      {subtitle ? <Text style={styles.cardSubtitle}>{subtitle}</Text> : null}
-      {children}
+      <BlurView intensity={40} tint="light" style={styles.card}>
+        <LinearGradient
+          colors={["rgba(255,255,255,0.54)", "rgba(255,255,255,0.04)"]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.cardSheen}
+        />
+        <View pointerEvents="none" style={styles.cardStroke} />
+        <Text style={styles.cardTitle}>{title}</Text>
+        {subtitle ? <Text style={styles.cardSubtitle}>{subtitle}</Text> : null}
+        {children}
+      </BlurView>
     </Animated.View>
   );
 }
@@ -1063,28 +1616,34 @@ function Field({
   return (
     <View style={styles.fieldWrap}>
       <Text style={styles.label}>{label}</Text>
-      <TextInput
-        value={value}
-        onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor="#8aa0b8"
-        secureTextEntry={secureTextEntry}
-        autoCapitalize="none"
-        autoCorrect={false}
-        multiline={multiline}
-        textAlignVertical={multiline ? "top" : "auto"}
-        style={[styles.input, multiline ? styles.inputMultiline : null]}
-        accessibilityLabel={label}
-      />
+      <BlurView
+        intensity={30}
+        tint="light"
+        style={[styles.inputShell, multiline ? styles.inputShellMultiline : null]}
+      >
+        <TextInput
+          value={value}
+          onChangeText={onChangeText}
+          placeholder={placeholder}
+          placeholderTextColor="#7f9bb6"
+          secureTextEntry={secureTextEntry}
+          autoCapitalize="none"
+          autoCorrect={false}
+          multiline={multiline}
+          textAlignVertical={multiline ? "top" : "auto"}
+          style={[styles.input, multiline ? styles.inputMultiline : null]}
+          accessibilityLabel={label}
+        />
+      </BlurView>
     </View>
   );
 }
 
 function Badge({ text }: { text: string }) {
   return (
-    <View style={styles.badge}>
+    <BlurView intensity={28} tint="light" style={styles.badge}>
       <Text style={styles.badgeText}>{text}</Text>
-    </View>
+    </BlurView>
   );
 }
 
@@ -1320,38 +1879,87 @@ function SimpleList({ items }: { items: string[] }) {
 const styles = StyleSheet.create({
   loadingSafeArea: {
     flex: 1,
-    backgroundColor: "#eef3f8",
+    backgroundColor: "#e8f0ff",
     alignItems: "center",
     justifyContent: "center",
   },
   safeArea: {
     flex: 1,
-    backgroundColor: "#eef3f8",
+    backgroundColor: "#e8f0ff",
+  },
+  pageGradient: {
+    flex: 1,
+    position: "relative",
+  },
+  glowOrbTop: {
+    position: "absolute",
+    width: 260,
+    height: 260,
+    borderRadius: 130,
+    top: -90,
+    left: -70,
+  },
+  glowOrbRight: {
+    position: "absolute",
+    width: 300,
+    height: 300,
+    borderRadius: 150,
+    top: 130,
+    right: -120,
+  },
+  glowOrbBottom: {
+    position: "absolute",
+    width: 280,
+    height: 280,
+    borderRadius: 140,
+    bottom: -120,
+    left: -70,
   },
   keyboardAvoid: {
     flex: 1,
   },
   content: {
-    padding: 14,
-    paddingBottom: 34,
-    gap: 12,
+    width: "100%",
+    maxWidth: 980,
+    alignSelf: "center",
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 24,
+    gap: 10,
+  },
+  heroWrap: {
+    borderRadius: 28,
+    overflow: "hidden",
+    borderWidth: 1.2,
+    borderColor: "#b9d6ef",
   },
   heroCard: {
-    borderRadius: 18,
-    padding: 16,
-    gap: 8,
+    borderRadius: 28,
+    paddingHorizontal: 18,
+    paddingVertical: 22,
+    gap: 11,
+    position: "relative",
+  },
+  heroShine: {
+    position: "absolute",
+    top: -18,
+    right: -14,
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(255,255,255,0.2)",
   },
   heroTitle: {
     color: "#f8fdff",
     fontFamily: "Manrope_700Bold",
-    fontSize: 25,
-    letterSpacing: 0.2,
+    fontSize: 28,
+    letterSpacing: 0.4,
   },
   heroSubtitle: {
-    color: "#dcf4ff",
+    color: "#d7f8f7",
     fontFamily: "Manrope_400Regular",
     fontSize: 14,
-    lineHeight: 20,
+    lineHeight: 21,
   },
   heroBadgeRow: {
     flexDirection: "row",
@@ -1360,72 +1968,99 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   badge: {
-    paddingHorizontal: 9,
-    paddingVertical: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     backgroundColor: "rgba(255, 255, 255, 0.18)",
     borderRadius: 999,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.3)",
   },
   badgeText: {
     color: "#effbff",
     fontFamily: "Manrope_500Medium",
-    fontSize: 11,
+    fontSize: 11.5,
+  },
+  cardMotionWrap: {
+    borderRadius: 20,
+    overflow: "hidden",
   },
   card: {
-    borderRadius: 16,
-    backgroundColor: "#ffffff",
-    borderColor: "#d6e2ef",
-    borderWidth: 1,
-    padding: 14,
-    gap: 8,
-    elevation: 2,
+    borderRadius: 20,
+    backgroundColor: "rgba(248, 253, 255, 0.52)",
+    borderColor: "#d4e4f3",
+    borderWidth: 1.15,
+    padding: 13,
+    gap: 7,
+    elevation: 3,
+    overflow: "hidden",
     ...Platform.select({
       web: {
-        boxShadow: "0px 8px 16px rgba(11, 23, 37, 0.05)",
+        boxShadow: "0px 18px 30px rgba(22, 42, 64, 0.14)",
       },
       default: {
-        shadowColor: "#0b1725",
-        shadowOpacity: 0.05,
-        shadowOffset: { width: 0, height: 8 },
-        shadowRadius: 16,
+        shadowColor: "#10223a",
+        shadowOpacity: 0.12,
+        shadowOffset: { width: 0, height: 12 },
+        shadowRadius: 22,
       },
     }),
   },
+  cardSheen: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 44,
+  },
+  cardStroke: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "#d7e6f4",
+  },
   cardTitle: {
     fontFamily: "Manrope_700Bold",
-    color: "#10283f",
-    fontSize: 17,
+    color: "#102f48",
+    fontSize: 18,
   },
   cardSubtitle: {
     fontFamily: "Manrope_400Regular",
-    color: "#48627c",
+    color: "#3f5f79",
     fontSize: 13,
-    lineHeight: 18,
+    lineHeight: 19,
   },
   modeSwitch: {
     flexDirection: "row",
-    gap: 10,
+    flexWrap: "wrap",
+    gap: 7,
   },
   buttonMotionWrap: {
-    flex: 1,
+    flexGrow: 1,
+    flexBasis: 122,
   },
   modeButton: {
-    minHeight: 46,
+    minHeight: 48,
     borderWidth: 1,
-    borderColor: "#b6cade",
-    borderRadius: 12,
+    borderColor: "#d6e5f4",
+    borderRadius: 14,
     alignItems: "center",
     justifyContent: "center",
-    paddingHorizontal: 10,
-    backgroundColor: "#f8fbff",
+    paddingHorizontal: 12,
+    backgroundColor: "rgba(255,255,255,0.48)",
   },
   modeButtonActive: {
-    backgroundColor: "#e2f4ef",
-    borderColor: "#0f766e",
+    backgroundColor: "rgba(214, 249, 240, 0.78)",
+    borderColor: "#6caea3",
   },
   modeButtonText: {
     fontFamily: "Manrope_500Medium",
-    color: "#204564",
-    fontSize: 13,
+    color: "#1d4564",
+    fontSize: 13.5,
     textAlign: "center",
   },
   modeButtonTextActive: {
@@ -1435,7 +2070,7 @@ const styles = StyleSheet.create({
   outputTabsRow: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 8,
+    gap: 7,
     paddingVertical: 4,
   },
   modePillRow: {
@@ -1447,8 +2082,8 @@ const styles = StyleSheet.create({
   },
   modePill: {
     borderWidth: 1,
-    borderColor: "#c7d8e8",
-    backgroundColor: "#f6faff",
+    borderColor: "#d6e6f4",
+    backgroundColor: "rgba(255,255,255,0.48)",
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 4,
@@ -1487,56 +2122,56 @@ const styles = StyleSheet.create({
     lineHeight: 17,
   },
   outputTabMotionWrap: {
-    minWidth: 110,
+    flexGrow: 1,
+    minWidth: 116,
   },
   outputTab: {
-    minHeight: 36,
+    minHeight: 38,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: "#c4d6e8",
-    backgroundColor: "#f5f9ff",
-    paddingHorizontal: 14,
+    borderColor: "#d6e5f4",
+    backgroundColor: "rgba(255,255,255,0.5)",
+    paddingHorizontal: 15,
     alignItems: "center",
     justifyContent: "center",
   },
   outputTabActive: {
-    borderColor: "#0f766e",
-    backgroundColor: "#e6f4f2",
+    borderColor: "#68aba0",
+    backgroundColor: "rgba(218,248,240,0.8)",
   },
   outputTabText: {
     color: "#2a4c68",
     fontFamily: "Manrope_500Medium",
-    fontSize: 12,
+    fontSize: 12.5,
   },
   outputTabTextActive: {
     color: "#0f766e",
     fontFamily: "Manrope_700Bold",
   },
   outputPanel: {
-    marginTop: 8,
-    borderRadius: 12,
+    marginTop: 6,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#d7e5f1",
-    backgroundColor: "#f8fbff",
+    borderColor: "#d5e4f3",
+    backgroundColor: "rgba(252,255,255,0.66)",
     padding: 10,
-    gap: 4,
+    gap: 5,
   },
   fieldWrap: {
-    gap: 4,
+    gap: 3,
   },
   label: {
     fontFamily: "Manrope_500Medium",
-    fontSize: 13,
+    fontSize: 13.5,
     color: "#17344d",
   },
   input: {
-    minHeight: 46,
-    borderWidth: 1,
-    borderColor: "#c8d7e6",
-    borderRadius: 12,
-    paddingHorizontal: 11,
-    paddingVertical: 10,
-    backgroundColor: "#ffffff",
+    minHeight: 48,
+    borderWidth: 0,
+    borderRadius: 13,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    backgroundColor: "transparent",
     color: "#12324e",
     fontFamily: "Manrope_400Regular",
     fontSize: 14,
@@ -1544,26 +2179,42 @@ const styles = StyleSheet.create({
   inputMultiline: {
     minHeight: 92,
   },
+  inputShell: {
+    minHeight: 48,
+    borderWidth: 1,
+    borderColor: "#d7e5f4",
+    backgroundColor: "rgba(255,255,255,0.48)",
+    borderRadius: 14,
+    overflow: "hidden",
+  },
+  inputShellMultiline: {
+    minHeight: 92,
+  },
   actionRow: {
     flexDirection: "row",
-    gap: 8,
+    flexWrap: "wrap",
+    gap: 7,
+    marginTop: 4,
+  },
+  actionRowSingle: {
+    flexDirection: "row",
     marginTop: 4,
   },
   actionButton: {
-    minHeight: 48,
-    borderRadius: 12,
+    minHeight: 50,
+    borderRadius: 13,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
-    paddingHorizontal: 8,
+    paddingHorizontal: 10,
   },
   actionPrimary: {
-    backgroundColor: "#0f766e",
-    borderColor: "#0f766e",
+    backgroundColor: "rgba(16, 132, 124, 0.86)",
+    borderColor: "#8fd1c4",
   },
   actionSecondary: {
-    backgroundColor: "#f4f8fc",
-    borderColor: "#b3c6d9",
+    backgroundColor: "rgba(255,255,255,0.52)",
+    borderColor: "#d4e3f2",
   },
   actionDisabled: {
     opacity: 0.6,
@@ -1581,19 +2232,19 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   bodyText: {
-    color: "#183853",
+    color: "#173a56",
     fontFamily: "Manrope_400Regular",
     fontSize: 14,
-    lineHeight: 20,
+    lineHeight: 21,
   },
   metaText: {
-    color: "#4d657d",
+    color: "#476780",
     fontFamily: "Manrope_400Regular",
-    fontSize: 12,
-    lineHeight: 17,
+    fontSize: 12.5,
+    lineHeight: 18,
   },
   sectionTitle: {
-    marginTop: 8,
+    marginTop: 6,
     color: "#123450",
     fontFamily: "Manrope_700Bold",
     fontSize: 14,
@@ -1610,11 +2261,11 @@ const styles = StyleSheet.create({
   },
   profileTag: {
     borderWidth: 1,
-    borderColor: "#c5d7e9",
-    backgroundColor: "#f2f7fc",
-    borderRadius: 11,
+    borderColor: "#d5e4f3",
+    backgroundColor: "rgba(255,255,255,0.54)",
+    borderRadius: 12,
     paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingVertical: 9,
     width: "100%",
     minWidth: 0,
     gap: 2,
@@ -1638,19 +2289,19 @@ const styles = StyleSheet.create({
   },
   scriptCard: {
     borderWidth: 1,
-    borderColor: "#d5e0eb",
-    backgroundColor: "#f8fbfe",
-    borderRadius: 12,
-    padding: 10,
+    borderColor: "#d5e4f3",
+    backgroundColor: "rgba(255,255,255,0.56)",
+    borderRadius: 13,
+    padding: 11,
     gap: 4,
     borderLeftWidth: 4,
-    borderLeftColor: "#0f766e",
+    borderLeftColor: "#0f7f74",
   },
   postKitCard: {
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#cfe0ee",
-    backgroundColor: "#ffffff",
+    borderColor: "#d5e4f3",
+    backgroundColor: "rgba(255,255,255,0.62)",
     borderRadius: 10,
     padding: 8,
     gap: 3,
@@ -1676,6 +2327,33 @@ const styles = StyleSheet.create({
     color: "#102f4b",
     fontFamily: "Manrope_700Bold",
     fontSize: 13,
+  },
+  liveHeadline: {
+    color: "#0e597f",
+    fontFamily: "Manrope_700Bold",
+    fontSize: 17,
+    lineHeight: 23,
+  },
+  faqCard: {
+    borderWidth: 1,
+    borderColor: "#d4e3f2",
+    backgroundColor: "rgba(255,255,255,0.7)",
+    borderRadius: 10,
+    padding: 9,
+    gap: 4,
+    marginTop: 4,
+  },
+  faqQuestion: {
+    color: "#113654",
+    fontFamily: "Manrope_700Bold",
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  faqAnswer: {
+    color: "#1c425f",
+    fontFamily: "Manrope_400Regular",
+    fontSize: 13,
+    lineHeight: 19,
   },
   ratingRow: {
     flexDirection: "row",
@@ -1721,7 +2399,7 @@ const styles = StyleSheet.create({
   },
   modalBackdrop: {
     flex: 1,
-    backgroundColor: "rgba(9, 21, 35, 0.42)",
+    backgroundColor: "rgba(9, 21, 35, 0.5)",
     justifyContent: "center",
     alignItems: "center",
     padding: 24,
@@ -1729,13 +2407,25 @@ const styles = StyleSheet.create({
   modalCard: {
     width: "100%",
     maxWidth: 360,
-    borderRadius: 16,
-    backgroundColor: "#ffffff",
+    borderRadius: 18,
+    backgroundColor: "rgba(255,255,255,0.58)",
     borderWidth: 1,
-    borderColor: "#d3e1ee",
-    padding: 16,
+    borderColor: "#d2e3f3",
+    padding: 17,
     alignItems: "center",
-    gap: 8,
+    gap: 9,
+    overflow: "hidden",
+    ...Platform.select({
+      web: {
+        boxShadow: "0px 20px 32px rgba(11, 26, 41, 0.2)",
+      },
+      default: {
+        shadowColor: "#0b1a29",
+        shadowOpacity: 0.22,
+        shadowOffset: { width: 0, height: 14 },
+        shadowRadius: 24,
+      },
+    }),
   },
   modalIconWrap: {
     width: 44,
@@ -1789,5 +2479,57 @@ const styles = StyleSheet.create({
     color: "#ffffff",
     fontFamily: "Manrope_700Bold",
     fontSize: 13,
+  },
+  toastLayer: {
+    position: "absolute",
+    top: 12,
+    left: 12,
+    right: 12,
+    alignItems: "center",
+    zIndex: 80,
+  },
+  toastCard: {
+    width: "100%",
+    maxWidth: 680,
+    minHeight: 48,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#d2e2f3",
+    backgroundColor: "rgba(255,255,255,0.44)",
+    overflow: "hidden",
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    justifyContent: "center",
+    ...Platform.select({
+      web: {
+        boxShadow: "0px 12px 22px rgba(16, 44, 66, 0.18)",
+      },
+      default: {
+        shadowColor: "#102c42",
+        shadowOpacity: 0.2,
+        shadowOffset: { width: 0, height: 10 },
+        shadowRadius: 16,
+      },
+    }),
+  },
+  toastSuccess: {
+    borderColor: "#80cbb5",
+    backgroundColor: "rgba(227, 251, 242, 0.58)",
+  },
+  toastError: {
+    borderColor: "#dc9b8f",
+    backgroundColor: "rgba(255, 236, 232, 0.62)",
+  },
+  toastGlass: {
+    minHeight: 48,
+    justifyContent: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  toastText: {
+    color: "#123a59",
+    fontFamily: "Manrope_700Bold",
+    fontSize: 12.5,
+    lineHeight: 18,
   },
 });

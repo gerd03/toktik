@@ -151,3 +151,94 @@ export function buildFeedbackContext(examples: FeedbackExample[]): string {
 
   return lines.join("\n\n");
 }
+
+function normalizeDirective(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/[.]{2,}/g, ".")
+    .trim();
+}
+
+function uniqueNonEmpty(lines: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  for (const raw of lines) {
+    const normalized = normalizeDirective(raw);
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(normalized);
+  }
+
+  return output;
+}
+
+export function buildFeedbackDirectives(examples: FeedbackExample[]): string {
+  if (!examples.length) {
+    return [
+      "User preference directives:",
+      "- Keep outputs simple, direct, and conversion-focused.",
+      "- Use clean CTA and practical Taglish phrasing.",
+    ].join("\n");
+  }
+
+  const recent = examples
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )
+    .slice(0, 12);
+
+  const latest = recent[0];
+  const latestMustApply = uniqueNonEmpty([
+    latest?.whatWorked ?? "",
+    latest?.whatToImprove ?? "",
+  ]).slice(0, 4);
+
+  const preferredStyle = uniqueNonEmpty(
+    recent
+      .map((item) => item.whatWorked)
+      .filter(Boolean),
+  ).slice(0, 6);
+
+  const improveStyle = uniqueNonEmpty(
+    recent
+      .map((item) => item.whatToImprove)
+      .filter(Boolean),
+  ).slice(0, 8);
+
+  const lines: string[] = [];
+  lines.push("User preference directives (hard requirements):");
+
+  if (latestMustApply.length) {
+    lines.push("Latest feedback to apply now (highest priority):");
+    latestMustApply.forEach((item) => lines.push(`- ${item}`));
+  }
+
+  if (preferredStyle.length) {
+    lines.push("Preferred style:");
+    preferredStyle.forEach((item) => lines.push(`- ${item}`));
+  }
+
+  if (improveStyle.length) {
+    lines.push("Must improve / avoid:");
+    improveStyle.forEach((item) => lines.push(`- ${item}`));
+  }
+
+  if (!preferredStyle.length && !improveStyle.length) {
+    lines.push("- Keep outputs simple, direct, and conversion-focused.");
+    lines.push("- Use clean CTA and practical Taglish phrasing.");
+  }
+
+  lines.push(
+    "If there is conflict, prioritize 'Latest feedback to apply now' first, then 'Must improve / avoid'.",
+  );
+  return lines.join("\n");
+}
